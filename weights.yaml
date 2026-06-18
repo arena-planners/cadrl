@@ -1,0 +1,4 @@
+files:
+  - repo: arena-rosnav/cadrl
+    filename: cadrl_ga3c.npz
+    dest: model/cadrl_ga3c.npz
