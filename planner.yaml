@@ -4,11 +4,12 @@ obs_policy: latest_only
 controls_orientation: true
 
 depends:
-  global_plan: false
+  global_plan: true
 
 observations:
   aliases:
     robot_pose: robot_pose_from_tf
+    goal_pose: subgoal_from_plan
 
   datasources:
     robot_pose_from_tf:
@@ -29,3 +30,18 @@ observations:
       type: geometry_msgs/PoseStamped
       params:
         topic: goal_pose
+
+    global_plan:
+      type: nav_msgs/Path
+      params:
+        topic: plan
+
+    costmap:
+      type: nav_msgs/OccupancyGrid
+      params:
+        topic: global_costmap/costmap
+
+    subgoal_from_plan:
+      type: SubgoalGenerator
+      params:
+        lookahead: 2.0
