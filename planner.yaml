@@ -1,5 +1,5 @@
 action_type: differential_drive
-sensor_needs: []
+sensor_needs: [laserscan]
 obs_policy: latest_only
 controls_orientation: true
 
@@ -15,6 +15,11 @@ observations:
     robot_pose_from_tf:
       type: RobotPoseTFGenerator
       params: {}
+
+    laser_scan:
+      type: sensor_msgs/LaserScan
+      params:
+        sensor: laserscan
 
     robot_state:
       type: nav_msgs/Odometry

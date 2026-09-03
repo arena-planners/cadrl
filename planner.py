@@ -19,10 +19,12 @@ Observation (mirrors ``agent.Agent.observe`` with ``MULTI_AGENT_ARCH == 'RNN'``)
                 other_radius, combined_radius, dist_to_other_surface ]
 
 The host ego frame has its x-axis (``ref_prll``) pointing from the robot toward
-the goal and y-axis (``ref_orth``) 90deg left. Nearest ``MAX_NUM_OTHER_AGENTS=10``
-pedestrians within ``SENSING_HORIZON=8 m`` are kept, sorted farthest->nearest
-(upstream order); absent slots stay zero and ``num_other_agents`` sets the RNN
-sequence length.
+the goal and y-axis (``ref_orth``) 90deg left. Other agents are the pedestrians
+plus laser clusters (upstream ``cadrl_node`` consumes ``~clusters`` from a laser
+clustering node, so static obstacles reach the policy as zero-velocity agents).
+Nearest ``MAX_NUM_OTHER_AGENTS=10`` within ``SENSING_HORIZON=8 m`` are kept, sorted
+farthest->nearest (upstream order); absent slots stay zero and ``num_other_agents``
+sets the RNN sequence length.
 
 Action selection is the *deployed* GA3C behaviour (``cbComputeActionGA3C``):
 ``argmax`` over the policy head ``softmax(logits_p)``, then look up the discrete
@@ -66,6 +68,10 @@ _PED_RADIUS: float = 0.3            # PED_RADIUS
 _PREF_SPEED: float = 1.0            # default jackal_speed / Config host avg
 _NUM_ACTIONS: int = 11              # logits_p width (deployed network_01900000)
 _KP_YAW: float = 2.0               # upstream update_action: twist.angular.z = 2*yaw_error
+_CLUSTER_GAP: float = 0.3           # consecutive returns farther apart than this start a new cluster
+_CLUSTER_MIN_BEAMS: int = 2
+_CLUSTER_RADIUS_MIN: float = 0.15
+_CLUSTER_RADIUS_MAX: float = 1.0
 
 # Upstream network.Actions().actions (11 discrete [speed_fraction, heading_change]).
 _pi = np.pi
@@ -93,6 +99,42 @@ def _wrap(angle: float) -> float:
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
 
+def laser_clusters(ranges: np.ndarray, px: float, py: float, theta: float) -> list[tuple[float, float, float]]:
+    """World-frame (x, y, radius) clusters of a canonical scan (beam i at bearing 2*pi*i/N), non-returns read as the max range."""
+    r = np.asarray(ranges, dtype=np.float64)
+    n = r.size
+    if n < 2:
+        return []
+    bearings = theta + 2.0 * np.pi * np.arange(n) / n
+    valid = np.isfinite(r) & (r > 0.0) & (r < _SENSING_HORIZON) & (r < r.max() * 0.999)
+    xs = px + r * np.cos(bearings)
+    ys = py + r * np.sin(bearings)
+    clusters: list[list[int]] = []
+    current: list[int] = []
+    for i in range(n):
+        if not valid[i]:
+            if current:
+                clusters.append(current)
+                current = []
+            continue
+        if current and np.hypot(xs[i] - xs[current[-1]], ys[i] - ys[current[-1]]) > _CLUSTER_GAP:
+            clusters.append(current)
+            current = []
+        current.append(i)
+    if current:
+        clusters.append(current)
+    if len(clusters) > 1 and valid[0] and valid[n - 1] and np.hypot(xs[0] - xs[n - 1], ys[0] - ys[n - 1]) <= _CLUSTER_GAP:
+        clusters[0] = clusters.pop() + clusters[0]
+    out = []
+    for idx in clusters:
+        if len(idx) < _CLUSTER_MIN_BEAMS:
+            continue
+        cx, cy = float(xs[idx].mean()), float(ys[idx].mean())
+        extent = float(np.hypot(xs[idx] - cx, ys[idx] - cy).max())
+        out.append((cx, cy, float(np.clip(extent, _CLUSTER_RADIUS_MIN, _CLUSTER_RADIUS_MAX))))
+    return out
+
+
 class _Runner:
     def __init__(self) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -108,9 +150,9 @@ class _Runner:
         vy: float,
         gx: float,
         gy: float,
-        peds: np.ndarray | None,
+        others: list[tuple[float, float, float, float, float]],
     ) -> np.ndarray:
-        """Build the 75-d GA3C-CADRL host-frame state (agent.Agent.observe)."""
+        """Build the 75-d GA3C-CADRL host-frame state (agent.Agent.observe) from (x, y, vx, vy, radius) others."""
         state = np.zeros(
             1 + HOST_AGENT_OBSERVATION_LENGTH + MAX_NUM_OTHER_AGENTS_OBSERVED * OTHER_AGENT_OBSERVATION_LENGTH,
             dtype=np.float32,
@@ -134,22 +176,19 @@ class _Runner:
         state[1 + 2] = _PREF_SPEED
         state[1 + 3] = _ROBOT_RADIUS
 
-        if peds is None or len(peds) == 0:
+        if not others:
             state[0] = 0
             return state
 
-        # gather (dist_2_other_surface, px, py, vx, vy, radius) for in-range peds
+        # gather (dist_2_other_surface, px, py, vx, vy, radius) for in-range others
         candidates = []
-        for row in peds:
-            opx, opy = float(row[1]), float(row[2])
-            ovx = float(row[3]) if len(row) > 3 else 0.0
-            ovy = float(row[4]) if len(row) > 4 else 0.0
+        for opx, opy, ovx, ovy, oradius in others:
             rel = np.array([opx - px, opy - py], dtype=np.float64)
             dist_centers = float(np.linalg.norm(rel))
             if dist_centers > _SENSING_HORIZON:
                 continue
-            dist_surface = dist_centers - _ROBOT_RADIUS - _PED_RADIUS
-            candidates.append((dist_surface, opx, opy, ovx, ovy, _PED_RADIUS))
+            dist_surface = dist_centers - _ROBOT_RADIUS - oradius
+            candidates.append((dist_surface, opx, opy, ovx, ovy, oradius))
 
         # upstream: sort by surface distance ascending, reverse, keep last 10
         # (== keep the 10 nearest, ordered farthest -> nearest).
@@ -202,6 +241,24 @@ def _get_runner() -> _Runner:
     return _runner
 
 
+def _others(peds: np.ndarray | None, ranges: np.ndarray | None, px: float, py: float, theta: float) -> list[tuple[float, float, float, float, float]]:
+    """Pedestrians as moving agents plus laser clusters as static ones, clusters that coincide with a pedestrian dropped."""
+    out: list[tuple[float, float, float, float, float]] = []
+    if peds is not None:
+        for row in peds:
+            ovx = float(row[3]) if len(row) > 3 else 0.0
+            ovy = float(row[4]) if len(row) > 4 else 0.0
+            out.append((float(row[1]), float(row[2]), ovx, ovy, _PED_RADIUS))
+    if ranges is None:
+        return out
+    peds_xy = [(ox, oy) for ox, oy, _vx, _vy, _r in out]
+    for cx, cy, cr in laser_clusters(ranges, px, py, theta):
+        if any(np.hypot(cx - ox, cy - oy) <= cr + _PED_RADIUS for ox, oy in peds_xy):
+            continue
+        out.append((cx, cy, 0.0, 0.0, cr))
+    return out
+
+
 def step(features: dict) -> list[float]:
     """Map the bridge feature dict to a differential-drive [v, omega] twist."""
     runner = _get_runner()
@@ -220,9 +277,9 @@ def step(features: dict) -> list[float]:
     else:
         vx, vy = 0.0, 0.0
 
-    peds = features.get("pedestrians")
+    others = _others(features.get("pedestrians"), features.get("laser_scan"), px, py, theta)
 
-    state = runner.build_state(px, py, theta, vx, vy, gx, gy, peds)
+    state = runner.build_state(px, py, theta, vx, vy, gx, gy, others)
     v, heading_change = runner.act(state, theta)
 
     # upstream update_action: omega = 2 * yaw_error, with yaw_error == heading_change.
