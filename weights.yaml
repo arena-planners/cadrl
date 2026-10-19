@@ -2,3 +2,4 @@ files:
   - repo: arena-rosnav/cadrl
     filename: cadrl_ga3c.npz
     dest: model/cadrl_ga3c.npz
+    sha256: d06e4d95b6ed5598f5b11ac09314942320dd8c194d9e5c2eeb1e015c6f041300
